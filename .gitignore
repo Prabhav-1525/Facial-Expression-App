@@ -1,0 +1,14 @@
+﻿@""
+venv/
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
+Thumbs.db
+.env
+training/fer2013.csv
+app/deploy.prototxt
+app/res10_300x300_ssd_iter_140000.caffemodel
+models/*.h5
+models/*.tflite
+""@

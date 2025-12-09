@@ -1,0 +1,11 @@
+## requirements.txt
+flask==3.0.3
+opencv-python==4.10.0.84
+numpy==1.26.4
+tensorflow==2.16.1
+scikit-learn==1.5.2
+pillow==10.4.0
+matplotlib==3.9.2
+urllib3==2.2.3
+pandas>=2.0.0
+gunicorn==23.0.0
