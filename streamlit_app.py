@@ -1,4 +1,6 @@
 # streamlit_app.py
+import os
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 import av
 import cv2
 import numpy as np

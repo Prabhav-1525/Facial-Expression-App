@@ -1,0 +1,3 @@
+[server]
+fileWatcherType = "none"   # disable inotify/polling watchers on Cloud
+headless = true
