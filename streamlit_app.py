@@ -3,7 +3,7 @@ import av
 import cv2
 import numpy as np
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 # Import your existing inference pipeline
 from app.inference import predict_from_bgr
@@ -60,11 +60,14 @@ class FERVideoProcessor(VideoProcessorBase):
 
 ctx = webrtc_streamer(
     key="fer-demo",
-    mode="SENDRECV",
-    rtc_configuration=RTC_CONFIGURATION,
+    mode=WebRtcMode.SENDRECV,  # <-- use enum, not "SENDRECV"
+    rtc_configuration=RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    ),
     media_stream_constraints={"video": True, "audio": False},
     video_processor_factory=FERVideoProcessor,
 )
+
 
 # live update of alpha (smoothing) if you later add EMA inside processor
 if ctx and ctx.video_processor:
