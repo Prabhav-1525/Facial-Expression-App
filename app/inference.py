@@ -77,19 +77,36 @@ def _detect_faces_dnn(frame_bgr, conf=0.30):  # ↓ lowered from 0.6 to 0.30
     return boxes
 
 def _align_face(gray, box):
-    x, y, w, h = box
-    roi = gray[y:y+h, x:x+w]
+    # box may contain numpy types; coerce and guard
+    x, y, w, h = [int(v) for v in box]
+    if w <= 0 or h <= 0:
+        return gray  # nothing to do
+
+    # Crop ROI safely
+    H, W = gray.shape[:2]
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    roi = gray[y0:y1, x0:x1].copy()
+
+    # Detect eyes inside ROI
     eyes = EYE_CASCADE.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
+
     if len(eyes) >= 2:
+        # pick two left-most eyes
         eyes = sorted(eyes, key=lambda e: e[0])[:2]
-        (x1, y1, w1, h1) = eyes[0]
-        (x2, y2, w2, h2) = eyes[1]
-        p1 = (x1 + w1 // 2, y1 + h1 // 2)
-        p2 = (x2 + w2 // 2, y2 + h2 // 2)
-        dy, dx = (p2[1] - p1[1]), (p2[0] - p1[0])
-        angle = np.degrees(np.arctan2(dy, dx))
-        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-        roi = cv2.warpAffine(roi, M, (w, h), flags=cv2.INTER_LINEAR)
+        (x1e, y1e, w1e, h1e), (x2e, y2e, w2e, h2e) = eyes
+        p1 = (x1e + w1e // 2, y1e + h1e // 2)
+        p2 = (x2e + w2e // 2, y2e + h2e // 2)
+
+        dy, dx = float(p2[1] - p1[1]), float(p2[0] - p1[0])
+        angle = float(np.degrees(np.arctan2(dy, dx)))
+
+        # center must be Python floats
+        cx, cy = float(roi.shape[1] * 0.5), float(roi.shape[0] * 0.5)
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        aligned = cv2.warpAffine(roi, M, (roi.shape[1], roi.shape[0]), flags=cv2.INTER_LINEAR)
+        return aligned
+
     return roi
 
 def _preprocess_face(bgr, box):

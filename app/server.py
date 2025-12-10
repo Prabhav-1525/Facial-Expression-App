@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify
 from .inference import predict_from_bgr, decode_image 
+import traceback
 
 app = Flask(__name__)
 
@@ -9,20 +10,27 @@ def index():
     return render_template('index.html')
 
 
-@app.post('/predict')
+@app.post("/predict")
 def predict():
-    if 'frame' not in request.files:
-        return jsonify({"success": False, "error": "No frame"}), 400
+    try:
+        if "frame" in request.files:
+            data = request.files["frame"].read()
+        elif "image" in request.files:
+            data = request.files["image"].read()
+        else:
+            return jsonify({"success": False, "error": "No file field (frame/image)"}), 400
 
+        img = decode_image(data)
+        if img is None:
+            return jsonify({"success": False, "error": "Decode failed"}), 400
 
-    file = request.files['frame']
-    img = decode_image(file.read())
-    if img is None:
-        return jsonify({"success": False, "error": "Bad image"}), 400
+        res = predict_from_bgr(img)
+        return jsonify(res)
 
-
-    result = predict_from_bgr(img)
-    return jsonify(result)
+    except Exception as e:
+        print("[server] /predict error:", e)
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == '__main__':
