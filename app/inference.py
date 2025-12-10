@@ -53,7 +53,12 @@ if PROTOTXT.exists() and CAFFEMODEL.exists():
 HAAR_FACE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 
-def _detect_faces_dnn(frame_bgr, conf=0.6):
+def _detect_faces_haar(frame_bgr):
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    rects = HAAR_FACE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    return [(x, y, w, h) for (x, y, w, h) in rects]
+
+def _detect_faces_dnn(frame_bgr, conf=0.30):  # ↓ lowered from 0.6 to 0.30
     if DNN is None:
         return []
     h, w = frame_bgr.shape[:2]
@@ -70,11 +75,6 @@ def _detect_faces_dnn(frame_bgr, conf=0.6):
         x2, y2 = min(w - 1, x2), min(h - 1, y2)
         boxes.append((x1, y1, x2 - x1, y2 - y1))
     return boxes
-
-def _detect_faces_haar(frame_bgr):
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    rects = HAAR_FACE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-    return [(x, y, w, h) for (x, y, w, h) in rects]
 
 def _align_face(gray, box):
     x, y, w, h = box
@@ -103,7 +103,7 @@ def _preprocess_face(bgr, box):
     return np.expand_dims(rgb, axis=0)  # (1,96,96,3)
 
 def predict_from_bgr(frame_bgr):
-    faces = _detect_faces_dnn(frame_bgr, conf=0.6)
+    faces = _detect_faces_dnn(frame_bgr, conf=0.30)
     if not faces:
         faces = _detect_faces_haar(frame_bgr)  # fallback
 
@@ -125,3 +125,6 @@ def predict_from_bgr(frame_bgr):
 def decode_image(file_bytes: bytes):
     arr = np.frombuffer(file_bytes, dtype=np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+# Quick test
+print(f"[inference] faces_dnn={len(_detect_faces_dnn(frame_bgr, 0.30))}")
