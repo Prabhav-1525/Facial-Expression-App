@@ -26,9 +26,22 @@ alpha = st.slider("Smoothing (EMA α)", 0.0, 1.0, 0.6, 0.05)
 
 # Public Google STUN server
 RTC_CONFIGURATION = {
-    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        # TURN over TCP/TLS (replace with your real creds)
+        {
+            "urls": [
+                "turn:global.relay.metered.ca:80",
+                "turn:global.relay.metered.ca:443",
+                "turns:global.relay.metered.ca:443?transport=tcp",
+            ],
+            "username": "<YOUR_TURN_USERNAME>",
+            "credential": "<YOUR_TURN_PASSWORD>",
+        },
+    ],
+    # Force using TURN only; avoids flaky UDP paths on Streamlit Cloud
+    "iceTransportPolicy": "relay",
 }
-
 class FERVideoProcessor(VideoProcessorBase):
     def __init__(self):
         self.alpha = 0.6
