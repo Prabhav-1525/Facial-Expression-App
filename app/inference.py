@@ -126,5 +126,3 @@ def decode_image(file_bytes: bytes):
     arr = np.frombuffer(file_bytes, dtype=np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-# Quick test
-print(f"[inference] faces_dnn={len(_detect_faces_dnn(frame_bgr, 0.30))}")
