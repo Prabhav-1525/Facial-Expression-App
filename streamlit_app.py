@@ -1,11 +1,9 @@
 # streamlit_app.py
-# Full Streamlit app with WebRTC (TURN-ready), async processing, connection status,
-# and a snapshot fallback. Works with TensorFlow 2.16.1 on Python 3.11.
-
 import os
-
-# Disable file watching on Streamlit Cloud to avoid inotify limits
-os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+import json
+import urllib.request
+from pathlib import Path
+from typing import Optional, Tuple
 
 import av
 import cv2
@@ -18,32 +16,34 @@ from streamlit_webrtc import (
     VideoProcessorBase,
 )
 
-# Your inference function & labels come from the Flask app's module
-from app.inference import predict_from_bgr
-
-# ---------------------------- Streamlit UI ----------------------------
+# =============== UI ===============
 st.set_page_config(page_title="Facial Expression Recognition", layout="wide")
-st.title("Facial Expression Recognition\n(FER2013 → MobileNetV2)")
+st.title("Facial Expression Recognition\n(📦 FER2013 → 🧠 MobileNetV2)")
 
 st.markdown(
-    "Real-time webcam demo using OpenCV DNN face detection + Keras model "
-    "(angry, happy, sad, neutral)."
+    "Real-time webcam demo using OpenCV DNN face detection + a fine-tuned Keras model "
+    "(classes: **angry**, **happy**, **sad**, **neutral**)."
 )
 
-alpha = st.slider("Smoothing (EMA α)", 0.0, 1.0, 0.60, 0.05, help="Applies EMA to probabilities.")
+# =============== TURN / WebRTC config ===============
+def _get_secret(name: str, default: str = "") -> str:
+    # Prefer Streamlit Secrets (cloud), fall back to env (local)
+    val = ""
+    try:
+        val = st.secrets.get(name, "")
+    except Exception:
+        pass
+    if not val:
+        val = os.getenv(name, default)
+    return val
 
-# ---------------------------- WebRTC / TURN ---------------------------
-# Read TURN credentials from environment (recommended for secrets)
-TURN_USERNAME = os.getenv("TURN_USERNAME", "").strip()
-TURN_PASSWORD = os.getenv("TURN_PASSWORD", "").strip()
+TURN_USERNAME = _get_secret("TURN_USERNAME")
+TURN_PASSWORD = _get_secret("TURN_PASSWORD")
 USE_TURN = bool(TURN_USERNAME and TURN_PASSWORD)
 
-# Base config with public STUN
-RTC_CONFIGURATION: dict = {
+RTC_CONFIGURATION: RTCConfiguration = {
     "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}],
 }
-
-# If TURN creds provided, add TURN and force relay to avoid UDP flakiness on some hosts
 if USE_TURN:
     RTC_CONFIGURATION["iceServers"].append(
         {
@@ -56,147 +56,239 @@ if USE_TURN:
             "credential": TURN_PASSWORD,
         }
     )
+    # Force relay to avoid UDP-blocked environments
     RTC_CONFIGURATION["iceTransportPolicy"] = "relay"
+else:
+    st.warning(
+        "TURN credentials not found. On Streamlit Cloud, WebRTC usually needs a TURN relay.\n\n"
+        "Add **TURN_USERNAME** and **TURN_PASSWORD** in **App → Settings → Secrets** "
+        "(e.g., free key from metered.ca/openrelay).",
+        icon="⚠️",
+    )
 
-# ------------------------ Video Processor (webrtc) --------------------
+# =============== Model & Detector (global singletons) ===============
+BASE_DIR = Path(__file__).parent.resolve()
+APP_DIR = (BASE_DIR / "app").resolve()  # reuse the same files as Flask version, if present
+MODELS_DIR = (BASE_DIR / "models").resolve()
+
+LABELS_PATH = APP_DIR / "labels.json"
+if not LABELS_PATH.exists():
+    # Fallback to local labels
+    LABELS = ["angry", "happy", "sad", "neutral"]
+else:
+    with open(LABELS_PATH, "r") as f:
+        LABELS = json.load(f)
+
+# Prefer Keras format
+PREFERRED_MODEL = MODELS_DIR / "fer_mnet_4cls.keras"
+
+def _find_latest_model() -> Optional[Path]:
+    cands = sorted(
+        list(MODELS_DIR.glob("*.keras")) + list(MODELS_DIR.glob("*.h5")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if cands:
+        return cands[0]
+    # SavedModel directory fallback
+    dirs = sorted(
+        [d for d in MODELS_DIR.iterdir() if d.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for d in dirs:
+        if (d / "saved_model.pb").exists():
+            return d
+    return None
+
+@st.cache_resource(show_spinner=True)
+def load_keras_model():
+    import tensorflow as tf
+    target = PREFERRED_MODEL if PREFERRED_MODEL.exists() else _find_latest_model()
+    if target is None:
+        raise FileNotFoundError(f"No model found in {MODELS_DIR}. Train and upload one.")
+    st.write(f"[model] Loading: `{target}`")
+    model = tf.keras.models.load_model(str(target))
+    # Warm-up to allocate kernels
+    try:
+        _ = model.predict(np.zeros((1, 96, 96, 3), dtype="float32"), verbose=0)
+        st.write("[model] Warm-up done.")
+    except Exception as e:
+        st.write(f"[model] Warm-up skipped: {e}")
+    return model
+
+@st.cache_resource(show_spinner=True)
+def load_face_detector():
+    prototxt = APP_DIR / "deploy.prototxt"
+    caffemodel = APP_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
+    urls = {
+        "prototxt": "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
+        "caffemodel": "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel",
+    }
+    for p, key in [(prototxt, "prototxt"), (caffemodel, "caffemodel")]:
+        if not p.exists():
+            try:
+                urllib.request.urlretrieve(urls[key], p)
+            except Exception as e:
+                st.warning(f"[detector] Could not download {p.name}: {e}")
+    if prototxt.exists() and caffemodel.exists():
+        net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
+        st.write("[detector] OpenCV DNN face detector loaded.")
+        return net
+    st.error("Face detector weights missing. Upload `deploy.prototxt` and "
+             "`res10_300x300_ssd_iter_140000.caffemodel` into `app/`.")
+    return None
+
+MODEL = load_keras_model()
+DNN = load_face_detector()
+EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+
+# =============== Pre/Post utilities ===============
+def detect_faces_dnn(frame_bgr: np.ndarray, conf: float = 0.6) -> list[Tuple[int, int, int, int]]:
+    if DNN is None:
+        return []
+    h, w = frame_bgr.shape[:2]
+    blob = cv2.dnn.blobFromImage(
+        frame_bgr, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=False, crop=False
+    )
+    DNN.setInput(blob)
+    det = DNN.forward()
+    boxes: list[Tuple[int, int, int, int]] = []
+    for i in range(det.shape[2]):
+        score = float(det[0, 0, i, 2])
+        if score < conf:
+            continue
+        x1, y1, x2, y2 = (det[0, 0, i, 3:7] * np.array([w, h, w, h])).astype(int)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        boxes.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+    return boxes
+
+def align_face(gray: np.ndarray, box_wh: Tuple[int, int, int, int]) -> np.ndarray:
+    # box_wh in local ROI coordinates: (0,0,w,h)
+    _, _, w, h = box_wh
+    roi = gray.copy()
+    eyes = EYE_CASCADE.detectMultiScale(
+        roi, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20)
+    )
+    if len(eyes) >= 2:
+        eyes = sorted(eyes, key=lambda e: e[0])[:2]
+        (x1, y1, w1, h1) = map(int, eyes[0])
+        (x2, y2, w2, h2) = map(int, eyes[1])
+        p1 = (int(x1 + w1 // 2), int(y1 + h1 // 2))
+        p2 = (int(x2 + w2 // 2), int(y2 + h2 // 2))
+        dy, dx = (p2[1] - p1[1]), (p2[0] - p1[0])
+        angle = float(np.degrees(np.arctan2(dy, dx)))
+        center = (int(w // 2), int(h // 2))
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        roi = cv2.warpAffine(roi, M, (int(w), int(h)), flags=cv2.INTER_LINEAR)
+    return roi
+
+def preprocess_face(bgr: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = [int(v) for v in box]
+    face = bgr[y : y + h, x : x + w]
+    if face.size == 0:
+        # fallback to center crop if bad box
+        H, W = bgr.shape[:2]
+        cx, cy = W // 2, H // 2
+        s = min(H, W) // 2
+        face = bgr[cy - s : cy + s, cx - s : cx + s]
+    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+    gray = align_face(gray, (0, 0, gray.shape[1], gray.shape[0]))
+    gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype("float32") / 255.0
+    return np.expand_dims(rgb, axis=0)  # (1,96,96,3)
+
+def softmax_to_dict(pred: np.ndarray) -> dict:
+    return {LABELS[i]: float(pred[i]) for i in range(len(LABELS))}
+
+def ema(curr: dict, prev: Optional[dict], alpha: float) -> dict:
+    if prev is None:
+        return curr
+    out = {}
+    for k in curr.keys():
+        out[k] = alpha * curr[k] + (1.0 - alpha) * prev.get(k, 0.0)
+    return out
+
+# =============== Streamlit controls ===============
+alpha = st.slider("Smoothing (EMA α)", min_value=0.0, max_value=1.0, value=0.60, step=0.05)
+
+# =============== WebRTC video processor ===============
 class FERVideoProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.alpha = 0.60
-        self.prev_probs = None  # for EMA smoothing
+    def __init__(self, alpha_val: float = 0.6):
+        self.alpha = float(alpha_val)
+        self.prev: Optional[dict] = None
 
-    def _ema(self, curr: dict) -> dict:
-        """Apply EMA to a dict of probabilities keyed by label."""
-        if self.prev_probs is None:
-            self.prev_probs = curr
-            return curr
-        out = {k: self.alpha * curr[k] + (1.0 - self.alpha) * self.prev_probs[k] for k in curr}
-        self.prev_probs = out
-        return out
+    def _predict(self, frame_bgr: np.ndarray) -> Tuple[dict, Optional[Tuple[int, int, int, int]]]:
+        faces = detect_faces_dnn(frame_bgr, conf=0.60)
+        if not faces:
+            return ({lbl: 0.0 for lbl in LABELS}, None)
+        x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+        inp = preprocess_face(frame_bgr, (x, y, w, h))
+        preds = MODEL.predict(inp, verbose=0)[0]
+        probs = softmax_to_dict(preds)
+        return probs, (x, y, w, h)
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # Convert frame to BGR
-        bgr = frame.to_ndarray(format="bgr24")
-
-        # Run inference (handles detection + preprocessing internally)
-        out = predict_from_bgr(bgr)
-
-        vis = bgr.copy()
-        face = out.get("face")
-        probs = out.get("probs", {})
-
-        # Smooth probabilities for stability
-        if probs:
-            probs = self._ema(probs)
+        img = frame.to_ndarray(format="bgr24")
+        probs, box = self._predict(img)
+        smoothed = ema(probs, self.prev, self.alpha)
+        self.prev = smoothed
 
         # Draw overlays
-        if face:
-            x, y, w, h = face["x"], face["y"], face["w"], face["h"]
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (80, 160, 255), 2)
+        vis = img.copy()
+        if box:
+            x, y, w, h = [int(v) for v in box]
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (122, 162, 247), 2)
 
-            # Determine top label from smoothed probs if available
-            if probs:
-                top_lbl = max(probs.items(), key=lambda kv: kv[1])[0]
-                top_score = probs[top_lbl] * 100.0
-                label = f"{top_lbl} {top_score:.1f}%"
-            elif out.get("top"):
-                label = f'{out["top"]["label"]} {out["top"]["score"] * 100:.1f}%'
-            else:
-                label = "face"
-
-            cv2.putText(
-                vis,
-                label,
-                (x, max(0, y - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (80, 160, 255),
-                2,
-                cv2.LINE_AA,
-            )
-        else:
-            cv2.putText(
-                vis,
-                "No face",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (160, 160, 160),
-                2,
-                cv2.LINE_AA,
-            )
-
+        # Top label from smoothed scores
+        lbl = max(smoothed, key=smoothed.get)
+        score = smoothed[lbl]
+        cv2.putText(
+            vis,
+            f"{lbl}: {score*100:.1f}%",
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
         return av.VideoFrame.from_ndarray(vis, format="bgr24")
 
-
-# ---------------------------- WebRTC Component ------------------------
+# =============== Start WebRTC ===============
+st.subheader("Live webcam (WebRTC)")
 ctx = webrtc_streamer(
     key="fer-demo",
-    mode=WebRtcMode.SENDRECV,  # enum (not a string)
-    rtc_configuration=RTC_CONFIGURATION,  # dict is fine
-    media_stream_constraints={
-        "video": {"width": {"ideal": 640}, "height": {"ideal": 480}},
-        "audio": False,
-    },
-    video_processor_factory=FERVideoProcessor,
-    async_processing=True,     # don't block UI thread
-    sendback_audio=False,
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={"video": True, "audio": False},
+    video_processor_factory=lambda: FERVideoProcessor(alpha_val=alpha),
 )
 
-# Live-tune alpha on the processor
-if ctx and ctx.video_processor:
-    ctx.video_processor.alpha = float(alpha)
-
-# ---------------------------- Connection Status -----------------------
+# Connection status panel
 st.subheader("Connection status")
-if ctx is None:
-    st.warning("Component not initialized.")
+if ctx and hasattr(ctx, "peer_connection") and ctx.peer_connection:
+    pc = ctx.peer_connection
+    st.write("iceConnectionState:", getattr(pc, "iceConnectionState", None))
+    st.write("connectionState:", getattr(pc, "connectionState", None))
 else:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.write("state:", getattr(ctx, "state", None))
-        st.write("playing:", getattr(ctx, "playing", None))
-    pc = getattr(ctx, "peer_connection", None)
-    if pc is not None:
-        with col2:
-            st.write("signalingState:", getattr(pc, "signalingState", None))
-            st.write("iceConnectionState:", getattr(pc, "iceConnectionState", None))
-        with col3:
-            st.write("connectionState:", getattr(pc, "connectionState", None))
-            st.caption(
-                "If ICE stays at 'checking/failed', ensure TURN credentials are set "
-                "via environment variables TURN_USERNAME and TURN_PASSWORD."
-            )
+    st.write("Waiting for peer connection…")
 
-# ---------------------------- Snapshot Fallback -----------------------
-st.divider()
-st.subheader("Fallback: Snapshot mode")
-snap = st.camera_input("If live video doesn’t start, use a snapshot")
+# =============== Snapshot fallback ===============
+st.markdown("---")
+st.subheader("Snapshot fallback (works without WebRTC)")
+snap = st.camera_input("Take a snapshot (then deselect to retake)")
 if snap is not None:
-    # Decode JPEG to BGR
-    arr = np.frombuffer(snap.getvalue(), np.uint8)
+    # Decode to OpenCV
+    bytes_data = snap.getvalue()
+    arr = np.frombuffer(bytes_data, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-    out = predict_from_bgr(bgr)
-    vis = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    f = out.get("face")
-    if f:
-        x, y, w, h = f["x"], f["y"], f["w"], f["h"]
-        cv2.rectangle(vis, (x, y), (x + w, y + h), (80, 160, 255), 2)
-        if out.get("top"):
-            cv2.putText(
-                vis,
-                f'{out["top"]["label"]} {out["top"]["score"]*100:.1f}%',
-                (x, max(0, y - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (80, 160, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-    st.image(vis, caption="Snapshot prediction", use_column_width=True)
-    if "probs" in out:
-        st.json(out["probs"])
-
-st.caption("Tip: use good lighting and look straight at the camera for best results.")
+    probs, box = FERVideoProcessor(alpha_val=alpha)._predict(bgr)
+    lbl = max(probs, key=probs.get)
+    st.write("Predicted:", f"**{lbl}** ({probs[lbl]*100:.1f}%)")
+    st.json({k: round(v, 4) for k, v in probs.items()})
+    if box:
+        x, y, w, h = [int(v) for v in box]
+        cv2.rectangle(bgr, (x, y), (x + w, y + h), (122, 162, 247), 2)
+    st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption="Detection")
