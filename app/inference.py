@@ -35,6 +35,11 @@ def _load_model():
     return tf.keras.models.load_model(str(target))
 
 MODEL = _load_model()
+try:
+    _ = MODEL.predict(np.zeros((1, 96, 96, 3), dtype="float32"), verbose=0)
+    print("[inference] Model warm-up done.")
+except Exception as e:
+    print("[inference] Warm-up skipped:", e)
 
 # ---------------- Face detectors ----------------
 # Use local, vendored DNN files (commit them to app/)
